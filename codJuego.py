@@ -1,84 +1,134 @@
-import pygame
-import math
-import random
+import pygame, random, math
 
 pygame.init()
-WIDTH, HEIGHT = 1000, 600
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Hill Drive Evo 9")
 
-# Colores
-SKY = (135, 206, 235)
+# --- CONFIGURACIÓN GENERAL ---
+ANCHO, ALTO = 900, 500
+FPS = 60
+VENTANA = pygame.display.set_mode((ANCHO, ALTO))
+pygame.display.set_caption("Hill Drive Evo - Terreno Suave")
 
-# Auto
-car_img = pygame.image.load("assets/lancer.png").convert_alpha()  # Auto con transparencia real
-car_img = pygame.transform.scale(car_img, (120, 60))
-car_x, car_y = 100, 400
-car_speed_y = 0
-gravity = 0.6
-lift = -12
-on_ground = False
+# --- COLORES ---
+CELESTE = (135, 206, 250)
+VERDE = (34, 139, 34)
+CAFE = (139, 69, 19)
 
-# Terreno
-terrain = [450 + math.sin(i / 40) * 50 + random.randint(-5, 5) for i in range(3000)]
-camera_x = 0
+# --- IMAGEN DEL AUTO ---
+car_img = pygame.image.load("assets/lancer.png").convert_alpha()
+car_img = pygame.transform.scale(car_img, (130, 65))
 
-# Textura del terreno
-ground_texture = pygame.image.load("assets/ground.png").convert()
-ground_texture = pygame.transform.scale(ground_texture, (20, 20))  # Ajusta tamaño de bloque
+# --- AUTO ---
+car = {
+    "x": 150,
+    "y": 300,
+    "vel_x": 2.0,
+    "vel_y": 0.0,
+    "rot": 0.0,
+    "on_ground": False
+}
 
+# --- FUNCIÓN: GENERAR TERRENO SUAVE ---
+def generar_terreno(largo=4000, altura_media=360, suavizado=50):
+    """
+    Genera un terreno suave usando interpolación entre puntos aleatorios.
+    - largo: cantidad total de puntos
+    - altura_media: altura base del terreno
+    - suavizado: define la distancia entre puntos de control
+    """
+    terreno = []
+    puntos_control = []
+
+    # Crear puntos base aleatorios
+    for i in range(0, largo, suavizado):
+        y = altura_media + random.randint(-70, 70)
+        puntos_control.append((i, y))
+
+    # Interpolar entre los puntos de control (curvas suaves)
+    for i in range(len(puntos_control) - 1):
+        x1, y1 = puntos_control[i]
+        x2, y2 = puntos_control[i + 1]
+
+        for t in range(suavizado):
+            # interpolación cúbica tipo “hermita”
+            mu = t / suavizado
+            mu2 = (1 - math.cos(mu * math.pi)) / 2
+            y = (y1 * (1 - mu2) + y2 * mu2)
+            terreno.append(y)
+
+    return terreno
+
+terreno = generar_terreno()
+
+# --- FUNCIÓN: OBTENER ALTURA DEL TERRENO ---
+def altura_terreno(x):
+    if x < 0: return terreno[0]
+    if x >= len(terreno): return terreno[-1]
+    return terreno[int(x)]
+
+# --- LOOP PRINCIPAL ---
 clock = pygame.time.Clock()
+offset_x = 0
 running = True
 
 while running:
-    clock.tick(60)
-    screen.fill(SKY)
-
-    # Eventos
+    # --- EVENTOS ---
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
 
+    # --- CONTROLES ---
     keys = pygame.key.get_pressed()
     if keys[pygame.K_d]:
-        camera_x += 4
+        car["vel_x"] += 0.05
     if keys[pygame.K_a]:
-        camera_x -= 4
-    if keys[pygame.K_w] and on_ground:
-        car_speed_y = lift
-        on_ground = False
+        car["vel_x"] -= 0.05
 
-    # Física del auto
-    car_y += car_speed_y
-    car_speed_y += gravity
+    car["vel_x"] = max(1.5, min(5, car["vel_x"]))
+    offset_x += car["vel_x"]
 
-    # Limitar cámara
-    camera_x = max(0, min(len(terrain) - WIDTH, camera_x))
+    # --- FÍSICA DEL AUTO ---
+    terreno_y = altura_terreno(car["x"] + offset_x)
+    siguiente_y = altura_terreno(car["x"] + offset_x + 5)
+    pendiente = math.atan2(siguiente_y - terreno_y, 5)
 
-    # Detección de terreno
-    terrain_index = int(car_x + camera_x)
-    if terrain_index >= len(terrain):
-        terrain_index = len(terrain) - 1
-    terrain_y = terrain[terrain_index]
-    if car_y >= terrain_y - car_img.get_height()//2:
-        car_y = terrain_y - car_img.get_height()//2
-        car_speed_y = 0
-        on_ground = True
+    # Gravedad y salto
+    if not car["on_ground"]:
+        car["vel_y"] += 0.5
+    if keys[pygame.K_SPACE] and car["on_ground"]:
+        car["vel_y"] = -9
+        car["on_ground"] = False
 
-    # Dibujar terreno con textura
-    for i in range(WIDTH):
-        idx = i + int(camera_x)
-        if idx >= len(terrain):
-            break
-        ty = terrain[idx]
-        y = ty
-        while y < HEIGHT:
-            screen.blit(ground_texture, (i, y))
-            y += ground_texture.get_height()
+    car["y"] += car["vel_y"]
 
-    # Dibujar auto
-    screen.blit(car_img, (car_x, car_y - car_img.get_height()//2))
+    # Colisión con el suelo
+    if car["y"] > terreno_y - 30:
+        car["y"] = terreno_y - 30
+        car["vel_y"] = 0
+        car["on_ground"] = True
+    else:
+        car["on_ground"] = False
 
+    # Rotación del auto según la pendiente
+    car["rot"] = math.degrees(-pendiente) * 0.8
+
+    # --- DIBUJO EN PANTALLA ---
+    VENTANA.fill(CELESTE)
+
+    # Terreno
+    puntos = []
+    for i in range(ANCHO):
+        t_y = altura_terreno(i + int(offset_x))
+        puntos.append((i, t_y))
+    pygame.draw.polygon(VENTANA, VERDE, puntos + [(ANCHO, ALTO), (0, ALTO)])
+    pygame.draw.lines(VENTANA, CAFE, False, puntos, 2)
+
+    # Auto
+    rot_img = pygame.transform.rotate(car_img, car["rot"])
+    rect = rot_img.get_rect(center=(car["x"], car["y"]))
+    VENTANA.blit(rot_img, rect)
+
+    # --- ACTUALIZAR ---
     pygame.display.flip()
+    clock.tick(FPS)
 
 pygame.quit()
