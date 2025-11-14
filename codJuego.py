@@ -1,9 +1,8 @@
-import pygame
+﻿import pygame
 import random
 import sys
 import math
-from typing import Tuple
-
+from typing import Tuple, List
 
 # ------------------------------
 # CONFIGURACIÓN GLOBAL (FÁCIL AJUSTE)
@@ -11,56 +10,61 @@ from typing import Tuple
 SCREEN_W, SCREEN_H = 1000, 600
 FPS = 60
 
+# debug
+DEBUG_SPAWN = False
+DEBUG_FORCE_SPAWN = True
+DEBUG_DRAW_PHYSICS = True # NUEVO: Dibujar línea de suelo y puntos de contacto
 
 # Tiles / estética
-TILE_SIZE = 64  # tamaño del "bloque" (cambiar para más/menos "Minecraft")
+TILE_SIZE = 64
 INITIAL_TILES = 800
-TERRAIN_Y = 420  # altura del tope del terreno (coordenada Y)
-
+TERRAIN_Y = 420
 
 # Jugador
 PLAYER_SCREEN_X = 150
-# tamaño del auto (aumentado: un poco más largo)
-PLAYER_WIDTH, PLAYER_HEIGHT = 240, 110
+CAR_SCALE = 0.35 # escala del sprite
+PLAYER_WIDTH_SCALED = int(260 * CAR_SCALE)
+PLAYER_HEIGHT_SCALED = int(90 * CAR_SCALE)
+PLAYER_CENTER_Y_OFFSET = -10 # Ajuste fino para centrar el coche en el punto de contacto
+GROUND_SNAP_TOLERANCE = 12  # tolerancia (px) para considerar que el coche está cerca del suelo
 
+# Física del Coche (Ajustado para jugabilidad tipo HCR)
+PLAYER_MASS = 80.0
+GRAVITY = 900.0 # Más fuerte para que caiga rápido
+ACCEL_GROUND = 600.0 # Aceleración en el suelo
+FRICTION_GROUND = 0.98 # Reducción de velocidad en el suelo
+AIR_RESISTANCE = 0.995 # Reducción de velocidad en el aire
+ANGULAR_VEL_MAX = math.pi * 1.5 # Velocidad de rotación máxima
+ANGULAR_ACCEL = math.pi * 0.05 # Aceleración de rotación
 
 # Fuel y moneda
 MAX_FUEL = 100.0
-FUEL_DECAY_PER_SEC = 5.0   # consumo por segundo
-FUEL_PICKUP = 40.0
-COIN_SPAWN_CHANCE = 0.045
-FUEL_SPAWN_CHANCE = 0.01
-# Control de separación entre collectibles (en tiles)
+FUEL_DECAY_PER_SEC = 3.0 # Ligeramente reducido
+FUEL_PICKUP = 30.0
+COIN_SPAWN_CHANCE = 0.15 # Más monedas para más progresión
+FUEL_SPAWN_CHANCE = 0.07
+NOS_SPAWN_CHANCE = 0.015
+NOS_DURATION = 8.0
+NOS_MULTIPLIER = 1.8 # Multiplicador de velocidad/fuerza durante el NOS
+COLLECTIBLE_VERTICAL_OFFSET = 18
 COLLECTIBLE_MIN_SEPARATION_TILES = 4
-
-# separación mínima específica para monedas (permite más coins que fuels)
 COIN_MIN_SEPARATION_TILES = 2
-
-# cuántos primeros tiles tendrán la textura 'calle' en su bloque superior
-# aumentado para una calle más larga
 INITIAL_STREET_TILES = 20
-# si True, la calle cubrirá el bloque superior de TODO el terreno
 STREET_FULL_LENGTH = True
 
-
 # Movimiento
-CAMERA_SPEED_PX_PER_SEC = 300.0
-
-# cuantos tiles por delante de la camara intentaremos spawnear collectibles
-SPAWN_AHEAD_TILES = 40
-
-# cuántos tiles por delante de la cámara intentamos mantener spawnados
+CAMERA_SPEED_PX_PER_SEC = 300.0 # Velocidad base (ahora usada solo como referencia)
 SPAWN_AHEAD_TILES = (SCREEN_W // TILE_SIZE) + 8
 
-
-# Sonidos (volúmenes)
+# Sonidos
 MUSIC_VOL = 0.25
 SFX_VOL = 0.8
 
+# ------------------------------
+# UTILIDADES (carga robusta de recursos) - (Mantenidas)
+# ------------------------------
+# ... (load_image, load_sound, load_sound_cached, load_music sin cambios) ...
 
-# ------------------------------
-# UTILIDADES (carga robusta de recursos)
-# ------------------------------
 def load_image(path: str, size: Tuple[int, int] = None, alpha=True, fallback_color=(160,120,60)):
     try:
         if alpha:
@@ -91,7 +95,6 @@ def load_sound(path: str):
         return Silent()
 
 
-# small cached loader for sounds to avoid repeated disk reads
 _sound_cache = {}
 def load_sound_cached(path: str):
     if path in _sound_cache:
@@ -116,7 +119,6 @@ def load_music(path: str):
     except Exception:
         return False
 
-
 # ------------------------------
 # SPRITES
 # ------------------------------
@@ -128,25 +130,30 @@ class Collectible(pygame.sprite.Sprite):
         self.rect = self.image.get_rect()
         self.world_x = float(world_x)
         self.world_y = float(world_y)
-        self.kind = kind  # 'coin' | 'fuel'
+        self.kind = kind  # 'coin' | 'fuel' | 'nos'
         self.collected = False
         self._anim = 0.0
-
+        # máscara para colisiones pixel-perfect
+        try:
+            self.mask = pygame.mask.from_surface(self.image)
+        except Exception:
+            self.mask = None
 
     def update_screen_pos(self, camera_x: float):
         sx = int(self.world_x - camera_x)
         sy = int(self.world_y)
         self.rect.topleft = (sx, sy)
 
-
     def animate(self, dt: float):
         if self.kind == 'coin':
-            # pequeña oscilación vertical para dar vida
             self._anim += 3.5 * dt
-            # keep base image (we'll offset when drawing)
             self.image = self.base_image
             self.rect = self.image.get_rect()
-
+            try:
+                # actualizar máscara si la imagen cambia
+                self.mask = pygame.mask.from_surface(self.image)
+            except Exception:
+                pass
 
     def draw(self, surface: pygame.Surface, camera_x: float):
         sx = int(self.world_x - camera_x)
@@ -156,7 +163,6 @@ class Collectible(pygame.sprite.Sprite):
             surface.blit(self.image, (sx, sy - offset))
         else:
             surface.blit(self.image, (sx, sy))
-
 
     def collect(self):
         self.collected = True
@@ -170,19 +176,11 @@ class Terrain:
     def __init__(self, tile_size:int, initial_tiles:int, base_y:int, ground_img:pygame.Surface):
         self.tile_size = tile_size
         self.base_y = base_y
+        # Inicialización del terreno: usar una lista de tuplas o solo la Y del tope.
+        # En este caso, se usa solo la Y del tope.
         self.tiles = [self.base_y for _ in range(initial_tiles)]
         self.ground_img = ground_img
-
-
-    def ensure_tiles(self, idx: int):
-        if idx < len(self.tiles):
-            return
-        # generar en chunks para eficiencia
-        while len(self.tiles) <= idx:
-            # terreno plano con micro variaciones opcionales
-            jitter = random.randint(-2, 2)
-            self.tiles.append(self.base_y + jitter)
-
+        self.add_random_ramps(0, initial_tiles, chance=0.04)
 
     def tile_y_at_pixel_x(self, world_x_px:int) -> int:
         tile_idx = max(0, world_x_px // self.tile_size)
@@ -190,94 +188,338 @@ class Terrain:
             self.ensure_tiles(tile_idx)
         return self.tiles[tile_idx]
 
+    # NUEVO: Obtiene el ángulo del terreno en un punto x
+    def terrain_angle_at_pixel_x(self, world_x_px: int) -> float:
+        tile_idx = max(0, world_x_px // self.tile_size)
+        if tile_idx + 1 >= len(self.tiles):
+            self.ensure_tiles(tile_idx + 1)
+        
+        # Coordenadas X, Y del centro del tile actual
+        x0 = tile_idx * self.tile_size
+        y0 = self.tiles[tile_idx]
 
+        # Coordenadas X, Y del centro del siguiente tile
+        x1 = (tile_idx + 1) * self.tile_size
+        y1 = self.tiles[tile_idx + 1]
+
+        # Interpolación: Calcular la Y en el punto exacto world_x_px
+        dx = world_x_px - x0
+        dy = y1 - y0
+        
+        # El ángulo se basa en la diferencia de altura (y1 - y0) sobre la distancia horizontal (tile_size)
+        # Invertimos dy porque Y aumenta hacia abajo
+        angle = math.atan2(y1 - y0, self.tile_size) 
+        
+        # El ángulo debe estar en radianes
+        return angle
+    
+    # NUEVO: Obtiene la Y interpolada en un punto X
+    def terrain_interpolated_y(self, world_x_px: int) -> int:
+        tile_idx = max(0, world_x_px // self.tile_size)
+        if tile_idx + 1 >= len(self.tiles):
+            self.ensure_tiles(tile_idx + 1)
+
+        y0 = self.tiles[tile_idx]
+        y1 = self.tiles[tile_idx + 1]
+        
+        # Posición relativa dentro del tile (0 a 1)
+        # Esto nos permite tener una línea suave entre el tope de cada tile
+        t = (world_x_px % self.tile_size) / self.tile_size
+        
+        interpolated_y = y0 + (y1 - y0) * t
+        return int(interpolated_y)
+
+    def ensure_tiles(self, idx: int):
+        if idx < len(self.tiles):
+            return
+        
+        # generar en chunks para eficiencia
+        while len(self.tiles) <= idx:
+            # Generar el terreno faltante usando la lógica de chunks (rampas)
+            self.generate_chunk(100)
+    
     def generate_chunk(self, count:int):
-        for _ in range(count):
+        i = 0
+        while i < count:
+            if random.random() < 0.08: # Aumento la chance de rampas
+                length = random.randint(6, 18) # Rampas más largas
+                # Altura: valores más grandes para rampas más pronunciadas (pendiente negativa = hacia arriba)
+                height_change = random.choice([
+                    random.randint(-150, -48), # Subida significativa
+                    random.randint(48, 150) # Bajada significativa
+                ])
+                for r in range(length):
+                    if i >= count:
+                        break
+                    
+                    # Calcular la pendiente lineal
+                    frac = r / length
+                    slope = int(frac * height_change)
+                    
+                    # Usar el último tile generado como base para la siguiente rampa
+                    base_y = self.tiles[-1] if self.tiles else self.base_y
+                    
+                    # Aplicar la pendiente sobre el nivel del tile anterior
+                    # Si el cambio de altura es positivo, es bajada; negativo, es subida.
+                    new_y = base_y + slope
+                    
+                    # Asegurar que el cambio no sea demasiado brusco al principio y al final
+                    if r > 0:
+                        prev_y = self.tiles[-1]
+                        # Controlar el cambio máximo de altura por tile para suavizar
+                        max_change = 10
+                        if abs(new_y - prev_y) > max_change:
+                            new_y = prev_y + math.copysign(max_change, new_y - prev_y)
+                    
+                    jitter = random.randint(-2, 2)
+                    self.tiles.append(new_y + jitter)
+                    i += 1
+                continue
+            
+            # normal tile
+            base_y = self.tiles[-1] if self.tiles else self.base_y
             jitter = random.randint(-2, 2)
-            self.tiles.append(self.base_y + jitter)
-
-
+            # Asegurar que la diferencia con el anterior no sea muy grande
+            max_flat_change = 4
+            if abs(base_y + jitter - self.tiles[-1]) > max_flat_change:
+                jitter = math.copysign(max_flat_change - 1, base_y + jitter - self.tiles[-1])
+            
+            self.tiles.append(base_y + jitter)
+            i += 1
+            
+    def add_random_ramps(self, start_idx:int = 0, end_idx: int = None, chance: float = 0.02):
+        if end_idx is None:
+            end_idx = len(self.tiles)
+        i = start_idx
+        while i < end_idx - 1:
+            if random.random() < chance:
+                length = random.randint(4, 12)
+                height_change = random.randint(-48, -12) # Solo subidas
+                for r in range(length):
+                    idx = i + r
+                    if idx >= end_idx:
+                        break
+                    
+                    frac = (r + 1) / length
+                    slope = int(frac * height_change)
+                    jitter = random.randint(-2, 2)
+                    
+                    # Usar TERRAIN_Y como base si estamos al inicio, o el valor del tile anterior
+                    base_y = self.tiles[i-1] if i > 0 else self.base_y 
+                    
+                    self.tiles[idx] = base_y + slope + jitter
+                i += length
+            else:
+                i += 1
+    
     def draw(self, surf:pygame.Surface, camera_x:float, player_tile: int = None, street_img: pygame.Surface = None):
-        """Draw terrain tiles. If player_tile and street_img are provided, the top cell of that tile
-        will be drawn using street_img so the 'calle' appears as part of the terrain.
-        """
         screen_tile_start = int(camera_x) // self.tile_size
         offset_x = int(camera_x) % self.tile_size
         tiles_on_screen = surf.get_width() // self.tile_size + 3
+        
         for i in range(tiles_on_screen):
             tile_idx = screen_tile_start + i
             if tile_idx >= len(self.tiles):
-                self.generate_chunk(200)
-            world_x = tile_idx * self.tile_size
+                # Generar un pequeño chunk para evitar el crash, aunque 'update' debería cubrirlo
+                self.generate_chunk(50) 
+            
             ty = self.tiles[tile_idx]
             screen_x = i * self.tile_size - offset_x
-            # dibujar la parte superior del tile:
-            # - si STREET_FULL_LENGTH está activado y street_img existe, usar street_img en todos los tiles
-            # - sino, usar la lógica previa (primeros INITIAL_STREET_TILES o player_tile)
+            
+            # Lógica de dibujo de calle/tierra
             used_top_img = None
             if street_img is not None and STREET_FULL_LENGTH:
                 used_top_img = street_img
-            else:
-                if tile_idx < INITIAL_STREET_TILES and street_img is not None:
-                    used_top_img = street_img
-                elif tile_idx == player_tile and street_img is not None:
-                    used_top_img = street_img
+            elif tile_idx < INITIAL_STREET_TILES and street_img is not None:
+                used_top_img = street_img
+            
+            # Dibujar la parte superior (calle o tierra)
+            top_img = used_top_img if used_top_img else self.ground_img
+            surf.blit(top_img, (screen_x, ty))
 
-            if used_top_img is not None:
-                try:
-                    surf.blit(used_top_img, (screen_x, ty))
-                except Exception:
-                    surf.blit(self.ground_img, (screen_x, ty))
-            else:
-                surf.blit(self.ground_img, (screen_x, ty))
-
+            # Dibujar el resto del terreno por debajo
             y = ty + self.tile_size
-
-            # dibujar el resto del terreno por debajo
             while y < surf.get_height():
                 surf.blit(self.ground_img, (screen_x, y))
                 y += self.tile_size
 
 
 # ------------------------------
-# PLAYER (jugador)
+# PLAYER CAR BODY (Para manejar la rotación visual)
+# ------------------------------
+class CarBody:
+    """Maneja el sprite visual del coche, incluyendo rotación y escalado."""
+    def __init__(self, base_image: pygame.Surface):
+        self.base_image = base_image
+        self.image = base_image
+        self.rect = self.image.get_rect()
+        self.angle = 0.0 # ángulo en radianes
+        
+    def rotate(self, angle_rad: float):
+        """Rota el sprite del coche. Angle es en radianes. Se convierte a grados para pygame."""
+        angle_deg = -math.degrees(angle_rad) # Negativo porque Pygame rota en sentido horario
+        self.angle = angle_rad
+        
+        # Guardar la posición del centro antes de rotar
+        old_center = self.rect.center
+        
+        # Rotar la imagen.
+        self.image = pygame.transform.rotate(self.base_image, angle_deg)
+        self.rect = self.image.get_rect(center=old_center)
+        
+    def set_position(self, screen_x: int, screen_y: int):
+        """Establece la posición del centro del sprite del coche en la pantalla.
+        Ahora `screen_y` representa la coordenada Y del centro del coche en pantalla.
+        """
+        # Ajustar el rect.center directamente usando la posición provista
+        self.rect.center = (screen_x, screen_y)
+
+
+# ------------------------------
+# PLAYER (jugador - ahora con física)
 # ------------------------------
 class Player:
-    def __init__(self, screen_x:int, image:pygame.Surface):
-        self.screen_x = screen_x
-        self.image = image
-        self.rect = self.image.get_rect()
-        self.world_x = 0.0
-        self.world_y = TERRAIN_Y
+    def __init__(self, screen_x:int, car_body:CarBody):
+        # Propiedades Físicas
+        # Posición inicial centrada en el terreno
+        # world_x se inicializa en la X de pantalla del jugador (la cámara lo mantendrá)
+        self.world_x = float(screen_x)
+        # world_y se posiciona de forma que el centro del sprite quede apoyado en el terreno base
+        self.world_y = float(TERRAIN_Y - (car_body.image.get_height() / 2) + PLAYER_CENTER_Y_OFFSET)
+        self.velocity_x = 0.0
+        self.velocity_y = 0.0
+        self.angle = 0.0 # en radianes
+        self.angular_velocity = 0.0
+        self.on_ground = True
+        
+        # Propiedades de Juego
+        self.screen_x = screen_x # X fija en la pantalla (cámara offset)
+        self.car_body = car_body # Instancia de CarBody (sprite + rotación)
+        self.rect = self.car_body.rect # Usamos el rect del cuerpo para colisiones
         self.coins = 0
         self.fuel = MAX_FUEL
+        self.speed_multiplier = 1.0 # Multiplicador de NOS
+        self.nos_time_left = 0.0
+        # Asegurar la posición visual inicial del CarBody
+        try:
+            self.car_body.set_position(self.screen_x, int(self.world_y))
+        except Exception:
+            pass
+        
+    # Posición inicial: colocar centrado sobre el terreno base
+
+    def place_on_terrain(self, terrain: 'Terrain', camera_x: float):
+        """Ajusta el coche al terreno si está lo suficientemente cerca."""
+        
+        # 1. Calcular la posición y ángulo del terreno bajo el centro del coche
+        # El punto de contacto es bajo el centro del coche.
+        contact_x = int(self.world_x)
+        terrain_y = terrain.terrain_interpolated_y(contact_x)
+        terrain_angle = terrain.terrain_angle_at_pixel_x(contact_x)
+        
+        # Distancia entre el coche y el terreno
+        car_bottom_y = self.world_y + (self.car_body.image.get_height() / 2) + PLAYER_CENTER_Y_OFFSET
+        y_diff = terrain_y - car_bottom_y
+        
+        # 2. Aplicar corrección y detectar el suelo
+        if y_diff > -GROUND_SNAP_TOLERANCE and self.velocity_y >= 0: # Si está cerca o tocando el suelo y bajando
+            self.world_y = terrain_y - (self.car_body.image.get_height() / 2) - PLAYER_CENTER_Y_OFFSET
+            self.velocity_y = 0.0 # Parar la caída
+            self.on_ground = True
+            
+            # Forzar el ángulo del coche a coincidir con el ángulo del terreno
+            self.angle = terrain_angle
+            self.angular_velocity = 0.0
+            
+            # Aplicar fricción al movimiento en el suelo
+            self.velocity_x *= FRICTION_GROUND
+        else:
+            self.on_ground = False
+            # Aplicar resistencia del aire al movimiento
+            self.velocity_x *= AIR_RESISTANCE
+            self.angular_velocity *= AIR_RESISTANCE
 
 
-    def place_on_terrain(self, terrain:Terrain, camera_x:float):
-        world_x = camera_x + self.screen_x
-        ty = terrain.tile_y_at_pixel_x(int(world_x))
-        self.world_x = world_x
-        # colocar la mitad inferior del auto sobre el tile top
-        self.world_y = ty - (self.image.get_height() // 2)
-        self.rect.topleft = (self.screen_x, int(self.world_y))
+    def update(self, dt: float, keys: List[bool], terrain: 'Terrain'):
+        # --- Lógica de NOS
+        if self.nos_time_left > 0:
+            self.nos_time_left -= dt
+            self.speed_multiplier = NOS_MULTIPLIER
+        else:
+            self.speed_multiplier = 1.0
+
+        # --- Aplicar Fuerzas
+        # Gravedad
+        if not self.on_ground:
+            self.velocity_y += GRAVITY * dt
+        
+        # Movimiento Horizontal (Aceleración de conducción)
+        accel_dir = 0
+        if keys[pygame.K_d]:
+            accel_dir = 1
+        elif keys[pygame.K_a]:
+            accel_dir = -1
+        
+        # Solo se puede acelerar si hay combustible
+        if self.fuel > 0 and self.on_ground and accel_dir != 0:
+            force_x = ACCEL_GROUND * accel_dir * self.speed_multiplier
+            self.velocity_x += force_x * dt
+            # Consumo de combustible
+            self.fuel -= FUEL_DECAY_PER_SEC * dt * 0.5 * self.speed_multiplier # Consumo más rápido con NOS
+
+        # Rotación (Balanceo en el aire)
+        if not self.on_ground and accel_dir != 0:
+            # Aplicar torque (aceleración angular)
+            self.angular_velocity += ANGULAR_ACCEL * accel_dir * dt
+            # Limitar la velocidad angular
+            self.angular_velocity = max(-ANGULAR_VEL_MAX, min(ANGULAR_VEL_MAX, self.angular_velocity))
+
+        # --- Actualizar Posición y Ángulo
+        self.world_x += self.velocity_x * dt
+        self.world_y += self.velocity_y * dt
+        self.angle += self.angular_velocity * dt
+        
+        # Aplicar la lógica de contacto con el terreno
+        self.place_on_terrain(terrain, 0) # La cámara ajusta el mundo, no el jugador
+
+        # Limitar la rotación para evitar loops
+        self.angle = self.angle % (2 * math.pi)
+
+        # Ajustar la posición visual del coche
+        self.car_body.rotate(self.angle)
+        self.car_body.set_position(self.screen_x, int(self.world_y))
+        
+        # Actualizar el rect de colisión del jugador con el rect del body rotado
+        self.rect = self.car_body.rect
 
 
     def draw(self, surf:pygame.Surface):
-        surf.blit(self.image, self.rect.topleft)
-
+        # El CarBody ya dibuja el sprite rotado en la posición correcta
+        surf.blit(self.car_body.image, self.car_body.rect.topleft)
+        
+        # [DEBUG] Dibujar punto de contacto y línea del suelo
+        if DEBUG_DRAW_PHYSICS:
+            # Dibujar el centro de rotación (base del coche)
+            contact_screen_y = self.car_body.rect.bottom + PLAYER_CENTER_Y_OFFSET
+            pygame.draw.circle(surf, (255, 0, 0), (self.screen_x, contact_screen_y), 4)
 
 # ------------------------------
-# HUD y Menú (UI simple y profesional)
+# HUD y Menú (UI simple y profesional) - (Mantenidas)
 # ------------------------------
+# ... (HUD, Button sin cambios) ...
+
 class HUD:
     def __init__(self, font:pygame.font.Font):
         self.font = font
-
 
     def draw(self, surf:pygame.Surface, player:Player):
         # Monedas
         txt = self.font.render(f"Monedas: {player.coins}", True, (255,215,0))
         surf.blit(txt, (20, 20))
+        # Distancia
+        dist_txt = self.font.render(f"Distancia: {int(player.world_x / 100)}m", True, (255, 255, 255))
+        surf.blit(dist_txt, (SCREEN_W - dist_txt.get_width() - 20, 20))
+        
         # Barra de fuel
         bx, by, bw, bh = 20, 60, 220, 20
         pygame.draw.rect(surf, (0,0,0), (bx, by, bw, bh), 2)
@@ -287,6 +529,10 @@ class HUD:
         # Porcentaje
         perc = self.font.render(f"{int(player.fuel)}%", True, (255,255,255))
         surf.blit(perc, (bx + bw + 10, by - 1))
+        # NOS status
+        if getattr(player, 'nos_time_left', 0.0) > 0:
+            nos_txt = self.font.render(f"NOS: {int(player.nos_time_left)}s", True, (120,200,255))
+            surf.blit(nos_txt, (20, 90))
 
 
 class Button:
@@ -297,20 +543,17 @@ class Button:
         self.bg = bg
         self.fg = fg
 
-
     def draw(self, surf:pygame.Surface):
         pygame.draw.rect(surf, self.bg, self.rect, border_radius=8)
         pygame.draw.rect(surf, (0,0,0), self.rect, 2, border_radius=8)
         txt = self.font.render(self.text, True, self.fg)
         surf.blit(txt, (self.rect.centerx - txt.get_width() // 2, self.rect.centery - txt.get_height() // 2))
 
-
     def is_clicked(self, pos):
         return self.rect.collidepoint(pos)
 
-
 # ------------------------------
-# GAME (control principal)
+# GAME (control principal) - (Ajustada para la nueva física)
 # ------------------------------
 class Game:
     def __init__(self):
@@ -324,18 +567,26 @@ class Game:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 24)
 
-
         # assets (carga con fallback)
         self.sky = load_image("assets/sky.png", (SCREEN_W * 2, SCREEN_H), alpha=False, fallback_color=(120,200,255))
         self.ground = load_image("assets/ground.png", (TILE_SIZE, TILE_SIZE), alpha=False, fallback_color=(160,100,50))
-        # imagen de la calle (solo el bloque que toca el auto)
         self.street_img = load_image("assets/calle.png", (TILE_SIZE, TILE_SIZE), alpha=False, fallback_color=(120,120,120))
-        self.car_img = load_image("assets/lancer.png", (PLAYER_WIDTH, PLAYER_HEIGHT), alpha=True, fallback_color=(220,220,220))
+        
+        # Coche: cargado y escalado
+        car_original_img = load_image("assets/lancer.png", size=None, alpha=True, fallback_color=(220,220,220))
+        try:
+            ow, oh = car_original_img.get_size()
+            tw = max(1, int(ow * CAR_SCALE))
+            th = max(1, int(oh * CAR_SCALE))
+            self.car_img = pygame.transform.scale(car_original_img, (tw, th))
+        except Exception:
+            self.car_img = car_original_img
+            
         self.coin_img = load_image("assets/coin.png", (36,36), alpha=True, fallback_color=(240,220,20))
+        self.nos_img = load_image("assets/nos.png", (40,40), alpha=True, fallback_color=(120,200,255))
         self.fuel_img = load_image("assets/fuel.png", (40,40), alpha=True, fallback_color=(200,0,0))
 
-
-        # sonidos: usar cache loader o load_sound según disponibilidad
+        # sonidos
         self.sfx_pick = load_sound_cached("assets/sfx_pickup.wav")
         self.sfx_gameover = load_sound_cached("assets/sfx_gameover.wav")
         music_loaded = load_music("assets/music.ogg")
@@ -345,123 +596,225 @@ class Game:
             except Exception:
                 pass
 
-
         # instancias
         self.terrain = Terrain(TILE_SIZE, INITIAL_TILES, TERRAIN_Y, self.ground)
-        self.player = Player(PLAYER_SCREEN_X, self.car_img)
+        self.car_body = CarBody(self.car_img)
+        self.player = Player(PLAYER_SCREEN_X, self.car_body)
         self.hud = HUD(self.font)
         self.camera_x = 0.0
 
-
         # collectibles
         self.collectibles = pygame.sprite.Group()
-        self.collectible_tiles = set()  # tiles que ya tienen un collectible
+        self.collectible_tiles = set()
         self.last_collectible_tile = -999
         self.last_coin_tile = -999
-        # ajustar probabilidades un poco más altas para más apariciones (más coins)
-        global COIN_SPAWN_CHANCE, FUEL_SPAWN_CHANCE
-        COIN_SPAWN_CHANCE = max(COIN_SPAWN_CHANCE, 0.12)
-        FUEL_SPAWN_CHANCE = max(FUEL_SPAWN_CHANCE, 0.02)
         self.spawn_initial_collectibles()
-
 
         # UI: menu buttons
         btn_w, btn_h = 220, 52
         self.btn_play = Button(pygame.Rect((SCREEN_W//2 - btn_w//2, SCREEN_H//2 - 70, btn_w, btn_h)), "JUGAR", self.font)
         self.btn_quit = Button(pygame.Rect((SCREEN_W//2 - btn_w//2, SCREEN_H//2 + 0, btn_w, btn_h)), "SALIR", self.font)
 
-
         # estado
         self.running = True
         self.in_menu = True
         self.game_over = False
 
-
-    # spawn collectibles distributed within first chunk so they appear at start
     def spawn_initial_collectibles(self):
+        # Resetear el estado de los coleccionables
         self.collectibles.empty()
-        # spawn coins/fuel across first N tiles aligned with player, but bias to more coins
+        self.collectible_tiles.clear()
+        self.last_collectible_tile = -999
+        self.last_coin_tile = -999
+        
+        # La altura de spawn es relativa al player (que está en TERRAIN_Y al inicio)
+        wy = int(self.player.world_y + COLLECTIBLE_VERTICAL_OFFSET)
+        
         end = min(len(self.terrain.tiles), 300)
-        # ensure last counters exist
-        last_collect = getattr(self, 'last_collectible_tile', -999)
-        last_coin = getattr(self, 'last_coin_tile', -999)
+        last_collect = self.last_collectible_tile
+        last_coin = self.last_coin_tile
+        
         for tile_idx in range(10, end):
             spawned = False
-            # intentar spawn de coin si cumple separación específica de coins
+            
+            # Intentar spawn de coin
             if tile_idx - last_coin >= COIN_MIN_SEPARATION_TILES and random.random() < COIN_SPAWN_CHANCE:
                 wx = tile_idx * TILE_SIZE + TILE_SIZE // 2
-                wy = self.player.world_y
                 coin = Collectible(wx, wy, self.coin_img, 'coin')
                 self.collectibles.add(coin)
-                # marcar tile como ocupado
                 self.collectible_tiles.add(tile_idx)
                 last_coin = tile_idx
                 last_collect = tile_idx
                 spawned = True
-            else:
-                # intentar spawn de fuel respetando la separación general
-                if tile_idx - last_collect >= COLLECTIBLE_MIN_SEPARATION_TILES and random.random() < FUEL_SPAWN_CHANCE:
-                    wx = tile_idx * TILE_SIZE + TILE_SIZE // 2
-                    wy = self.player.world_y
+            
+            # Intentar spawn de fuel/nos
+            elif tile_idx - last_collect >= COLLECTIBLE_MIN_SEPARATION_TILES:
+                wx = tile_idx * TILE_SIZE + TILE_SIZE // 2
+                
+                # Prioridad a NOS (más raro)
+                if random.random() < NOS_SPAWN_CHANCE:
+                    nos = Collectible(wx, wy, self.nos_img, 'nos')
+                    self.collectibles.add(nos)
+                    spawned = True
+                # Luego Fuel
+                elif random.random() < FUEL_SPAWN_CHANCE:
                     fuel = Collectible(wx, wy, self.fuel_img, 'fuel')
                     self.collectibles.add(fuel)
-                    # marcar tile como ocupado
+                    spawned = True
+                
+                if spawned:
                     self.collectible_tiles.add(tile_idx)
                     last_collect = tile_idx
-                    spawned = True
+
             if spawned:
-                # actualizar los atributos de seguimiento
                 self.last_collectible_tile = last_collect
                 self.last_coin_tile = last_coin
 
+    def force_spawn_near_player(self):
+        # Asegura que haya algunos items visibles al inicio, usando la lógica de spawn con altura relativa al terreno.
+        camera_tile = int(self.camera_x) // TILE_SIZE
+        start = camera_tile + 3
+        
+        for i, t in enumerate(range(start, start + 16)):
+            if t in self.collectible_tiles:
+                continue
+            
+            kind = None
+            if i % 11 == 0:
+                kind = 'nos'
+            elif i % 5 == 0:
+                kind = 'fuel'
+            elif i % 2 == 0:
+                kind = 'coin'
+            
+            if kind is None:
+                continue
+            
+            wx = t * TILE_SIZE + TILE_SIZE // 2
+            
+            # Usar la Y interpolada del terreno en el punto + offset
+            terrain_y_at_tile = self.terrain.terrain_interpolated_y(wx)
+            wy = int(terrain_y_at_tile + COLLECTIBLE_VERTICAL_OFFSET)
+            
+            img = self.coin_img
+            if kind == 'fuel':
+                img = self.fuel_img
+            elif kind == 'nos':
+                img = self.nos_img
+                
+            c = Collectible(wx, wy, img, kind)
+            self.collectibles.add(c)
+            self.collectible_tiles.add(t)
+            self.last_collectible_tile = t
+            if kind == 'coin':
+                self.last_coin_tile = t
 
     def spawn_collectible_at_tile(self, tile_idx:int):
-        # no crear si ya existe collectible en ese tile
         if tile_idx in getattr(self, 'collectible_tiles', set()):
             return
-        # intentar spawn con preferencia por coins pero respetando separaciones
+        
         last_collect = getattr(self, 'last_collectible_tile', -999)
         last_coin = getattr(self, 'last_coin_tile', -999)
-        # intentar coin primero si distancia suficiente desde última coin
+        
+        # Calcular la altura de spawn sobre el terreno en ese tile
+        wx = tile_idx * TILE_SIZE + TILE_SIZE // 2
+        
+        # Aseguramos que el tile exista antes de pedir la Y interpolada
+        if tile_idx + 1 >= len(self.terrain.tiles):
+             self.terrain.ensure_tiles(tile_idx + 1)
+             
+        terrain_y_at_tile = self.terrain.terrain_interpolated_y(wx)
+        wy = int(terrain_y_at_tile + COLLECTIBLE_VERTICAL_OFFSET)
+
+        spawned = False
+        kind = None
+
+        # Intentar coin
         if tile_idx - last_coin >= COIN_MIN_SEPARATION_TILES and random.random() < COIN_SPAWN_CHANCE:
-            wx = tile_idx * TILE_SIZE + TILE_SIZE // 2
-            wy = self.player.world_y
-            coin = Collectible(wx, wy, self.coin_img, 'coin')
-            self.collectibles.add(coin)
-            # marcar tile
-            self.collectible_tiles.add(tile_idx)
+            kind = 'coin'
             self.last_coin_tile = tile_idx
             self.last_collectible_tile = tile_idx
-            return
-        # si no salió coin, intentar fuel (respetando separación general)
-        if tile_idx - last_collect < COLLECTIBLE_MIN_SEPARATION_TILES:
-            return
-        if random.random() < FUEL_SPAWN_CHANCE:
-            wx = tile_idx * TILE_SIZE + TILE_SIZE // 2
-            wy = self.player.world_y
-            fuel = Collectible(wx, wy, self.fuel_img, 'fuel')
-            self.collectibles.add(fuel)
-            # marcar tile
-            self.collectible_tiles.add(tile_idx)
-            self.last_collectible_tile = tile_idx
+            spawned = True
+        # Intentar fuel/nos (si separación general es suficiente)
+        elif tile_idx - last_collect >= COLLECTIBLE_MIN_SEPARATION_TILES:
+            if random.random() < NOS_SPAWN_CHANCE:
+                kind = 'nos'
+                self.last_collectible_tile = tile_idx
+                spawned = True
+            elif random.random() < FUEL_SPAWN_CHANCE:
+                kind = 'fuel'
+                self.last_collectible_tile = tile_idx
+                spawned = True
 
+        if spawned:
+            img = self.coin_img
+            if kind == 'fuel':
+                img = self.fuel_img
+            elif kind == 'nos':
+                img = self.nos_img
+            
+            c = Collectible(wx, wy, img, kind)
+            self.collectibles.add(c)
+            self.collectible_tiles.add(tile_idx)
 
     def run(self):
-        while self.running:
-            dt_ms = self.clock.tick(FPS)
-            dt = dt_ms / 1000.0
-            self.handle_events()
-            if self.in_menu:
-                self.draw_menu()
-            else:
-                if not self.game_over:
-                    self.process_input(dt)
-                    self.update(dt)
-                self.draw_game()
-            pygame.display.flip()
-        pygame.quit()
-        sys.exit()
-
+        try:
+            while self.running:
+                dt_ms = self.clock.tick(FPS)
+                dt = dt_ms / 1000.0
+                self.handle_events()
+                
+                if self.in_menu:
+                    self.draw_menu()
+                else:
+                    if not self.game_over:
+                        self.process_input(dt) # Se mueve al update, pero mantenemos aquí por si hay más lógica de entrada
+                        self.update(dt)
+                    self.draw_game()
+                    
+                pygame.display.flip()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print("Unhandled exception in game loop:\n", tb)
+            try:
+                showing = True
+                while showing:
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            showing = False
+                        elif event.type == pygame.KEYDOWN and event.key == pygame.K_q:
+                            showing = False
+                    
+                    overlay = pygame.Surface((SCREEN_W, SCREEN_H))
+                    overlay.fill((20,20,30))
+                    font = pygame.font.SysFont('consolas', 16)
+                    lines = tb.splitlines()
+                    y = 10
+                    for line in lines[-30:]:
+                        surf = font.render(line, True, (255,200,200))
+                        overlay.blit(surf, (10, y))
+                        y += surf.get_height() + 2
+                    small = font.render('Presiona Q o cierra la ventana para salir', True, (200,200,200))
+                    overlay.blit(small, (10, SCREEN_H - 30))
+                    
+                    try:
+                        self.screen.blit(overlay, (0,0))
+                        pygame.display.flip()
+                    except Exception:
+                        pass
+                    self.clock.tick(10)
+            except Exception:
+                pass
+        finally:
+            try:
+                pygame.quit()
+            except Exception:
+                pass
+            try:
+                sys.exit()
+            except Exception:
+                pass
 
     def handle_events(self):
         for event in pygame.event.get():
@@ -478,62 +831,71 @@ class Game:
                     self.restart()
                 elif event.key == pygame.K_q:
                     self.running = False
-
+                    
+    def restart(self):
+        self.game_over = False
+        self.camera_x = 0.0
+        self.player.world_x = self.player.screen_x
+        self.player.world_y = TERRAIN_Y
+        self.player.velocity_x = 0.0
+        self.player.velocity_y = 0.0
+        self.player.angle = 0.0
+        self.player.angular_velocity = 0.0
+        self.player.coins = 0
+        self.player.fuel = MAX_FUEL
+        self.player.nos_time_left = 0.0
+        self.player.speed_multiplier = 1.0
+        self.spawn_initial_collectibles()
+        if DEBUG_FORCE_SPAWN:
+            self.force_spawn_near_player()
 
     def start_game(self):
         self.in_menu = False
-        self.game_over = False
-        self.camera_x = 0.0
-        self.player.coins = 0
-        self.player.fuel = MAX_FUEL
-        self.spawn_initial_collectibles()
-
+        self.restart() # Usamos restart para inicializar todo el estado de juego
 
     def process_input(self, dt:float):
-        keys = pygame.key.get_pressed()
-        if self.player.fuel > 0:
-            if keys[pygame.K_d]:
-                self.camera_x += CAMERA_SPEED_PX_PER_SEC * dt
-            if keys[pygame.K_a]:
-                self.camera_x -= CAMERA_SPEED_PX_PER_SEC * dt
-            if self.camera_x < 0:
-                self.camera_x = 0.0
-
+        # La entrada se procesa directamente en player.update() para la física.
+        pass
 
     def update(self, dt:float):
-        # generar tiles y collectibles cuando sea necesario
-        needed_px = int(self.camera_x) + SCREEN_W + (TILE_SIZE * 200)
-        needed_tile_index = needed_px // TILE_SIZE
-        if needed_tile_index >= len(self.terrain.tiles):
+        # --- Actualización del jugador
+        keys = pygame.key.get_pressed()
+        self.player.update(dt, keys, self.terrain)
+        
+        # --- Actualización de la cámara (sigue la X del jugador)
+        # La cámara se mueve para mantener al jugador en PLAYER_SCREEN_X
+        # La velocidad de la cámara es la velocidad de movimiento horizontal del jugador.
+        self.camera_x = self.player.world_x - self.player.screen_x
+        if self.camera_x < 0:
+            self.camera_x = 0.0
+            self.player.world_x = self.player.screen_x # Previene que el jugador vaya detrás del inicio
+
+        # --- Generación de terreno y coleccionables
+        camera_tile = int(self.camera_x) // TILE_SIZE
+        desired_ahead = SPAWN_AHEAD_TILES + 400
+        desired_len = camera_tile + desired_ahead
+        if len(self.terrain.tiles) < desired_len:
             old_len = len(self.terrain.tiles)
-            self.terrain.generate_chunk(300)
+            to_gen = desired_len - old_len
+            self.terrain.generate_chunk(to_gen)
+            # Intentar spawn de coleccionables en los nuevos tiles
             for t in range(old_len, len(self.terrain.tiles)):
                 self.spawn_collectible_at_tile(t)
 
-        # asegurarnos de tener spawn constante en la ventana por delante de la cámara
+        # --- Colisiones con Coleccionables (pixel-perfect usando máscaras)
         try:
-            camera_tile = int(self.camera_x) // TILE_SIZE
-            for t in range(camera_tile, camera_tile + SPAWN_AHEAD_TILES):
-                # asegurarnos de que el tile existe
-                if t >= len(self.terrain.tiles):
-                    self.terrain.ensure_tiles(t)
-                # intentar spawn en cada tile (función evita duplicados)
-                self.spawn_collectible_at_tile(t)
+            player_mask = pygame.mask.from_surface(self.player.car_body.image)
+            player_rect = self.player.car_body.rect
         except Exception:
-            pass
+            player_mask = None
+            player_rect = self.player.rect
 
-
-        # colocar jugador
-        self.player.place_on_terrain(self.terrain, self.camera_x)
-
-
-        # actualizar collectibles y colisiones
         for c in list(self.collectibles):
             c.animate(dt)
             c.update_screen_pos(self.camera_x)
-            # eliminar si muy atrasado
+
+            # Eliminar si está muy atrasado
             if c.world_x + 300 < self.camera_x:
-                # limpiar marca de tile
                 try:
                     tidx = int(c.world_x) // TILE_SIZE
                     self.collectible_tiles.discard(tidx)
@@ -541,112 +903,103 @@ class Game:
                     pass
                 c.kill()
                 continue
-            # colisión
-            if self.player.rect.colliderect(c.rect):
+
+            collided = False
+            try:
+                if player_mask is not None and getattr(c, 'mask', None) is not None:
+                    offset = (int(c.rect.x - player_rect.x), int(c.rect.y - player_rect.y))
+                    if player_mask.overlap(c.mask, offset):
+                        collided = True
+                else:
+                    # Fallback a AABB si máscaras no disponibles
+                    if self.player.rect.colliderect(c.rect):
+                        collided = True
+            except Exception:
+                # Fallback robusto
+                if self.player.rect.colliderect(c.rect):
+                    collided = True
+
+            if collided:
                 if c.kind == 'coin':
                     self.player.coins += 1
-                    # play sound safely
-                    try:
-                        self.sfx_pick.play()
-                    except Exception:
-                        pass
                 elif c.kind == 'fuel':
                     self.player.fuel = min(MAX_FUEL, self.player.fuel + FUEL_PICKUP)
-                    try:
-                        self.sfx_pick.play()
-                    except Exception:
-                        pass
-                # limpiar marca de tile antes de eliminar
+                elif c.kind == 'nos':
+                    self.player.nos_time_left = NOS_DURATION
+
                 try:
+                    self.sfx_pick.play()
                     tidx = int(c.world_x) // TILE_SIZE
                     self.collectible_tiles.discard(tidx)
                 except Exception:
                     pass
                 c.collect()
 
-
-        # fuel decay
-        if not self.game_over:
-            self.player.fuel -= FUEL_DECAY_PER_SEC * dt
-            if self.player.fuel <= 0:
-                self.player.fuel = 0
-                self.game_over = True
+        # --- Game Over
+        if self.player.fuel <= 0:
+            if not self.game_over:
                 try:
                     self.sfx_gameover.play()
                 except Exception:
                     pass
-
+            self.game_over = True
 
     def draw_menu(self):
-        self.screen.fill((40, 40, 60))
-        title = pygame.font.SysFont("consolas", 48).render("HILL DRIVE EVO 9", True, (255,255,255))
-        subtitle = pygame.font.SysFont("consolas", 18).render("Presiona JUGAR o Q para salir", True, (200,200,200))
-        self.screen.blit(title, (SCREEN_W//2 - title.get_width()//2, 80))
-        self.screen.blit(subtitle, (SCREEN_W//2 - subtitle.get_width()//2, 140))
+        # Fondo
+        self.screen.blit(self.sky, (0, 0))
+        # Overlay semi-transparente
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        self.screen.blit(overlay, (0, 0))
+        
+        # Título
+        title_font = pygame.font.SysFont("consolas", 48, bold=True)
+        title_txt = title_font.render("HILL DRIVE EVO 9", True, (255, 255, 255))
+        self.screen.blit(title_txt, (SCREEN_W // 2 - title_txt.get_width() // 2, SCREEN_H // 2 - 180))
+
+        # Botones
         self.btn_play.draw(self.screen)
         self.btn_quit.draw(self.screen)
 
-
     def draw_game(self):
-        # fondo cielo parallax
-        sky_x = -self.camera_x * 0.25
-        self.screen.blit(self.sky, (sky_x, 0))
-        self.screen.blit(self.sky, (sky_x + self.sky.get_width(), 0))
+        # Dibujar cielo (Parallax básico)
+        sky_scroll = int(-self.camera_x * 0.1) % self.sky.get_width()
+        self.screen.blit(self.sky, (sky_scroll, 0))
+        self.screen.blit(self.sky, (sky_scroll - self.sky.get_width(), 0))
 
+        # Dibujar terreno
+        self.terrain.draw(self.screen, self.camera_x, self.player.world_x // TILE_SIZE, self.street_img)
 
-        # terreno: dibujar la 'calle' como parte del terreno al final del mapa
-        try:
-            # elegir el último índice de tile disponible como tile de la calle
-            street_tile = len(self.terrain.tiles) - 1
-            if street_tile < 0:
-                street_tile = None
-        except Exception:
-            street_tile = None
-        # pasamos street_tile como player_tile param (no sigue al coche ahora)
-        self.terrain.draw(self.screen, self.camera_x, player_tile=street_tile, street_img=self.street_img)
-
-
-        # collectibles
+        # Dibujar coleccionables
+        # Recorremos la lista de sprites para poder usar el método draw personalizado
         for c in self.collectibles:
-            if -300 < c.rect.x < SCREEN_W + 300:
-                c.draw(self.screen, self.camera_x)
+            c.draw(self.screen, self.camera_x)
 
-
-        # player
+        # Dibujar jugador
         self.player.draw(self.screen)
-
-
-        # hud
+        
+        # Dibujar HUD
         self.hud.draw(self.screen, self.player)
 
-
-        # game over overlay + instrucciones
+        # Pantalla de Game Over
         if self.game_over:
             overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-            overlay.fill((0,0,0,170))
-            self.screen.blit(overlay, (0,0))
-            big = pygame.font.SysFont("consolas", 44).render("GAME OVER - SIN GASOLINA", True, (255,80,80))
-            small = pygame.font.SysFont("consolas", 20).render("Presiona R para reintentar o Q para salir", True, (255,255,255))
-            self.screen.blit(big, (SCREEN_W//2 - big.get_width()//2, SCREEN_H//2 - 50))
-            self.screen.blit(small, (SCREEN_W//2 - small.get_width()//2, SCREEN_H//2 + 10))
+            overlay.fill((0, 0, 0, 180))
+            self.screen.blit(overlay, (0, 0))
 
+            go_font = pygame.font.SysFont("consolas", 60, bold=True)
+            go_txt = go_font.render("GAME OVER", True, (255, 60, 60))
+            self.screen.blit(go_txt, (SCREEN_W // 2 - go_txt.get_width() // 2, SCREEN_H // 2 - 80))
 
-    def restart(self):
-        self.camera_x = 0.0
-        self.player.coins = 0
-        self.player.fuel = MAX_FUEL
-        self.collectibles.empty()
-        self.terrain = Terrain(TILE_SIZE, INITIAL_TILES, TERRAIN_Y, self.ground)
-        self.spawn_initial_collectibles()
-        self.game_over = False
+            score_txt = self.font.render(f"Distancia: {int(self.player.world_x / 100)}m | Monedas: {self.player.coins}", True, (255, 255, 255))
+            self.screen.blit(score_txt, (SCREEN_W // 2 - score_txt.get_width() // 2, SCREEN_H // 2 + 10))
 
+            restart_txt = self.font.render("Presiona R para Reiniciar o Q para Salir", True, (180, 180, 180))
+            self.screen.blit(restart_txt, (SCREEN_W // 2 - restart_txt.get_width() // 2, SCREEN_H // 2 + 60))
 
 # ------------------------------
-# Ejecutar
+# INICIO
 # ------------------------------
 if __name__ == "__main__":
     game = Game()
     game.run()
-
-
-
