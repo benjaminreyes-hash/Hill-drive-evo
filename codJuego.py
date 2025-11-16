@@ -26,7 +26,6 @@ CAR_SCALE = 0.35 # escala del sprite
 PLAYER_WIDTH_SCALED = int(260 * CAR_SCALE)
 PLAYER_HEIGHT_SCALED = int(90 * CAR_SCALE)
 PLAYER_CENTER_Y_OFFSET = -10 # Ajuste fino para centrar el coche en el punto de contacto
-GROUND_SNAP_TOLERANCE = 12  # tolerancia (px) para considerar que el coche está cerca del suelo
 
 # Física del Coche (Ajustado para jugabilidad tipo HCR)
 PLAYER_MASS = 80.0
@@ -34,8 +33,7 @@ GRAVITY = 900.0 # Más fuerte para que caiga rápido
 ACCEL_GROUND = 600.0 # Aceleración en el suelo
 FRICTION_GROUND = 0.98 # Reducción de velocidad en el suelo
 AIR_RESISTANCE = 0.995 # Reducción de velocidad en el aire
-ANGULAR_VEL_MAX = math.pi * 1.5 # Velocidad de rotación máxima
-ANGULAR_ACCEL = math.pi * 0.05 # Aceleración de rotación
+
 
 # Fuel y moneda
 MAX_FUEL = 100.0
@@ -46,12 +44,11 @@ FUEL_SPAWN_CHANCE = 0.07
 NOS_SPAWN_CHANCE = 0.015
 NOS_DURATION = 8.0
 NOS_MULTIPLIER = 1.8 # Multiplicador de velocidad/fuerza durante el NOS
-COLLECTIBLE_VERTICAL_OFFSET = 18
 COLLECTIBLE_MIN_SEPARATION_TILES = 4
 COIN_MIN_SEPARATION_TILES = 2
 INITIAL_STREET_TILES = 20
 STREET_FULL_LENGTH = True
-
+COLLECTIBLE_VERTICAL_OFFSET = -100
 # Movimiento
 CAMERA_SPEED_PX_PER_SEC = 300.0 # Velocidad base (ahora usada solo como referencia)
 SPAWN_AHEAD_TILES = (SCREEN_W // TILE_SIZE) + 8
@@ -133,11 +130,6 @@ class Collectible(pygame.sprite.Sprite):
         self.kind = kind  # 'coin' | 'fuel' | 'nos'
         self.collected = False
         self._anim = 0.0
-        # máscara para colisiones pixel-perfect
-        try:
-            self.mask = pygame.mask.from_surface(self.image)
-        except Exception:
-            self.mask = None
 
     def update_screen_pos(self, camera_x: float):
         sx = int(self.world_x - camera_x)
@@ -149,11 +141,6 @@ class Collectible(pygame.sprite.Sprite):
             self._anim += 3.5 * dt
             self.image = self.base_image
             self.rect = self.image.get_rect()
-            try:
-                # actualizar máscara si la imagen cambia
-                self.mask = pygame.mask.from_surface(self.image)
-            except Exception:
-                pass
 
     def draw(self, surface: pygame.Surface, camera_x: float):
         sx = int(self.world_x - camera_x)
@@ -355,24 +342,14 @@ class CarBody:
         self.rect = self.image.get_rect()
         self.angle = 0.0 # ángulo en radianes
         
-    def rotate(self, angle_rad: float):
-        """Rota el sprite del coche. Angle es en radianes. Se convierte a grados para pygame."""
-        angle_deg = -math.degrees(angle_rad) # Negativo porque Pygame rota en sentido horario
-        self.angle = angle_rad
-        
-        # Guardar la posición del centro antes de rotar
-        old_center = self.rect.center
-        
-        # Rotar la imagen.
-        self.image = pygame.transform.rotate(self.base_image, angle_deg)
-        self.rect = self.image.get_rect(center=old_center)
-        
+   
     def set_position(self, screen_x: int, screen_y: int):
-        """Establece la posición del centro del sprite del coche en la pantalla.
-        Ahora `screen_y` representa la coordenada Y del centro del coche en pantalla.
-        """
-        # Ajustar el rect.center directamente usando la posición provista
-        self.rect.center = (screen_x, screen_y)
+        """Establece la posición del centro de la base del coche en la pantalla."""
+        # Establece la parte inferior central del rectángulo del sprite en la posición dada
+        # El centro X está dado, el centro Y es la base Y (screen_y) - half_height
+        half_height = self.base_image.get_height() // 2
+        # La posición real del centro Y del sprite después de la rotación
+        self.rect.center = (screen_x, screen_y + half_height + PLAYER_CENTER_Y_OFFSET)
 
 
 # ------------------------------
@@ -381,15 +358,10 @@ class CarBody:
 class Player:
     def __init__(self, screen_x:int, car_body:CarBody):
         # Propiedades Físicas
-        # Posición inicial centrada en el terreno
-        # world_x se inicializa en la X de pantalla del jugador (la cámara lo mantendrá)
-        self.world_x = float(screen_x)
-        # world_y se posiciona de forma que el centro del sprite quede apoyado en el terreno base
-        self.world_y = float(TERRAIN_Y - (car_body.image.get_height() / 2) + PLAYER_CENTER_Y_OFFSET)
+        self.world_x = 0.0
+        self.world_y = TERRAIN_Y 
         self.velocity_x = 0.0
         self.velocity_y = 0.0
-        self.angle = 0.0 # en radianes
-        self.angular_velocity = 0.0
         self.on_ground = True
         
         # Propiedades de Juego
@@ -400,13 +372,10 @@ class Player:
         self.fuel = MAX_FUEL
         self.speed_multiplier = 1.0 # Multiplicador de NOS
         self.nos_time_left = 0.0
-        # Asegurar la posición visual inicial del CarBody
-        try:
-            self.car_body.set_position(self.screen_x, int(self.world_y))
-        except Exception:
-            pass
         
-    # Posición inicial: colocar centrado sobre el terreno base
+        # Posición inicial
+        self.world_x = self.screen_x # Inicialmente, la world_x es igual a la screen_x
+        self.car_body.set_position(self.screen_x, int(self.world_y))
 
     def place_on_terrain(self, terrain: 'Terrain', camera_x: float):
         """Ajusta el coche al terreno si está lo suficientemente cerca."""
@@ -422,14 +391,11 @@ class Player:
         y_diff = terrain_y - car_bottom_y
         
         # 2. Aplicar corrección y detectar el suelo
-        if y_diff > -GROUND_SNAP_TOLERANCE and self.velocity_y >= 0: # Si está cerca o tocando el suelo y bajando
+        if y_diff > -5 and self.velocity_y >= 0: # Si está cerca o tocando el suelo y bajando
             self.world_y = terrain_y - (self.car_body.image.get_height() / 2) - PLAYER_CENTER_Y_OFFSET
             self.velocity_y = 0.0 # Parar la caída
             self.on_ground = True
             
-            # Forzar el ángulo del coche a coincidir con el ángulo del terreno
-            self.angle = terrain_angle
-            self.angular_velocity = 0.0
             
             # Aplicar fricción al movimiento en el suelo
             self.velocity_x *= FRICTION_GROUND
@@ -437,7 +403,7 @@ class Player:
             self.on_ground = False
             # Aplicar resistencia del aire al movimiento
             self.velocity_x *= AIR_RESISTANCE
-            self.angular_velocity *= AIR_RESISTANCE
+          
 
 
     def update(self, dt: float, keys: List[bool], terrain: 'Terrain'):
@@ -466,31 +432,6 @@ class Player:
             self.velocity_x += force_x * dt
             # Consumo de combustible
             self.fuel -= FUEL_DECAY_PER_SEC * dt * 0.5 * self.speed_multiplier # Consumo más rápido con NOS
-
-        # Rotación (Balanceo en el aire)
-        if not self.on_ground and accel_dir != 0:
-            # Aplicar torque (aceleración angular)
-            self.angular_velocity += ANGULAR_ACCEL * accel_dir * dt
-            # Limitar la velocidad angular
-            self.angular_velocity = max(-ANGULAR_VEL_MAX, min(ANGULAR_VEL_MAX, self.angular_velocity))
-
-        # --- Actualizar Posición y Ángulo
-        self.world_x += self.velocity_x * dt
-        self.world_y += self.velocity_y * dt
-        self.angle += self.angular_velocity * dt
-        
-        # Aplicar la lógica de contacto con el terreno
-        self.place_on_terrain(terrain, 0) # La cámara ajusta el mundo, no el jugador
-
-        # Limitar la rotación para evitar loops
-        self.angle = self.angle % (2 * math.pi)
-
-        # Ajustar la posición visual del coche
-        self.car_body.rotate(self.angle)
-        self.car_body.set_position(self.screen_x, int(self.world_y))
-        
-        # Actualizar el rect de colisión del jugador con el rect del body rotado
-        self.rect = self.car_body.rect
 
 
     def draw(self, surf:pygame.Surface):
@@ -840,7 +781,6 @@ class Game:
         self.player.velocity_x = 0.0
         self.player.velocity_y = 0.0
         self.player.angle = 0.0
-        self.player.angular_velocity = 0.0
         self.player.coins = 0
         self.player.fuel = MAX_FUEL
         self.player.nos_time_left = 0.0
@@ -882,18 +822,11 @@ class Game:
             for t in range(old_len, len(self.terrain.tiles)):
                 self.spawn_collectible_at_tile(t)
 
-        # --- Colisiones con Coleccionables (pixel-perfect usando máscaras)
-        try:
-            player_mask = pygame.mask.from_surface(self.player.car_body.image)
-            player_rect = self.player.car_body.rect
-        except Exception:
-            player_mask = None
-            player_rect = self.player.rect
-
+        # --- Colisiones con Coleccionables
         for c in list(self.collectibles):
             c.animate(dt)
             c.update_screen_pos(self.camera_x)
-
+            
             # Eliminar si está muy atrasado
             if c.world_x + 300 < self.camera_x:
                 try:
@@ -903,30 +836,16 @@ class Game:
                     pass
                 c.kill()
                 continue
-
-            collided = False
-            try:
-                if player_mask is not None and getattr(c, 'mask', None) is not None:
-                    offset = (int(c.rect.x - player_rect.x), int(c.rect.y - player_rect.y))
-                    if player_mask.overlap(c.mask, offset):
-                        collided = True
-                else:
-                    # Fallback a AABB si máscaras no disponibles
-                    if self.player.rect.colliderect(c.rect):
-                        collided = True
-            except Exception:
-                # Fallback robusto
-                if self.player.rect.colliderect(c.rect):
-                    collided = True
-
-            if collided:
+            
+            # Colisión (ajustamos para usar el rect del car body)
+            if self.player.rect.colliderect(c.rect):
                 if c.kind == 'coin':
                     self.player.coins += 1
                 elif c.kind == 'fuel':
                     self.player.fuel = min(MAX_FUEL, self.player.fuel + FUEL_PICKUP)
                 elif c.kind == 'nos':
                     self.player.nos_time_left = NOS_DURATION
-
+                
                 try:
                     self.sfx_pick.play()
                     tidx = int(c.world_x) // TILE_SIZE
